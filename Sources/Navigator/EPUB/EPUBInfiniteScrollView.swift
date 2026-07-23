@@ -14,6 +14,9 @@ protocol EPUBInfiniteScrollViewDelegate: AnyObject {
 
     /// Called when the loaded views or current index changed.
     func infiniteScrollViewDidUpdateViews(_ view: EPUBInfiniteScrollView)
+
+    /// Called as the continuous viewport moves within or between resources.
+    func infiniteScrollViewDidScroll(_ view: EPUBInfiniteScrollView)
 }
 
 /// Renders EPUB chapters stacked vertically in a single continuous scroll.
@@ -35,6 +38,13 @@ final class EPUBInfiniteScrollView: UIScrollView {
     /// Actual content heights once each chapter's WebView has rendered.
     private var resolvedHeights: [Int: CGFloat] = [:]
 
+    /// Height and prefix-offset indexes for every reading-order resource.
+    ///
+    /// Keeping geometry for unloaded resources lets a fast fling resolve its
+    /// destination without scanning only the currently materialized window.
+    private var chapterHeights: [CGFloat] = []
+    private var chapterOffsets: [CGFloat] = [0]
+
     /// KVO tokens observing each chapter's `webView.scrollView.contentSize`.
     private var heightObservations: [Int: NSKeyValueObservation] = [:]
 
@@ -42,7 +52,17 @@ final class EPUBInfiniteScrollView: UIScrollView {
     private let preloadWindow = 2
 
     /// Estimate used before a chapter's actual height is known.
-    private let placeholderHeight: CGFloat = 1400
+    ///
+    /// One viewport is deliberately conservative: it gives an unresolved
+    /// chapter enough room to render and measure without creating a large
+    /// artificial gap for short title/separator resources.
+    private var placeholderHeight: CGFloat {
+        max(1, bounds.height)
+    }
+
+    /// Prevents geometry corrections from recursively changing the active
+    /// resource while `contentOffset` is being compensated.
+    private var isUpdatingGeometry = false
 
     // MARK: - Init
 
@@ -74,6 +94,7 @@ final class EPUBInfiniteScrollView: UIScrollView {
         chapterCount = max(0, count)
         evictAll()
         guard chapterCount > 0 else { return }
+        resetHeightIndex()
         currentIndex = max(0, min(index, chapterCount - 1))
         updateWindow(movingTo: location)
     }
@@ -104,14 +125,12 @@ final class EPUBInfiniteScrollView: UIScrollView {
         super.layoutSubviews()
         guard chapterCount > 0 else { return }
 
-        var y: CGFloat = 0
         let w = bounds.width
         for i in 0 ..< chapterCount {
             let h = height(for: i)
-            loadedViews[i]?.frame = CGRect(x: 0, y: y, width: w, height: h)
-            y += h
+            loadedViews[i]?.frame = CGRect(x: 0, y: yOffset(for: i), width: w, height: h)
         }
-        contentSize = CGSize(width: w, height: y)
+        contentSize = CGSize(width: w, height: chapterOffsets.last ?? 0)
     }
 
     // MARK: - Window Management
@@ -134,7 +153,12 @@ final class EPUBInfiniteScrollView: UIScrollView {
         }
 
         var hi = min(chapterCount - 1, currentIndex + preloadWindow)
-        acc = (currentIndex + 1 ... max(currentIndex + 1, hi)).reduce(0) { $0 + height(for: $1) }
+        acc = 0
+        if hi > currentIndex {
+            for i in (currentIndex + 1) ... hi {
+                acc += height(for: i)
+            }
+        }
         while hi < chapterCount - 1, acc < preloadDistance {
             hi += 1
             acc += height(for: hi)
@@ -158,10 +182,14 @@ final class EPUBInfiniteScrollView: UIScrollView {
             // Body can resize after load (CSS injection, font loading) without
             // any contentSize KVO signal — the viewport pins contentSize to the
             // frame height. A ResizeObserver in the page reports those changes.
-            view.registerJSMessage(named: "bodyResized") { [weak self, weak view] _ in
+            view.registerJSMessage(named: "bodyResized") { [weak self, weak view] body in
                 DispatchQueue.main.async {
                     guard let self, let view else { return }
-                    self.measureContentHeight(of: view, at: i)
+                    if let height = (body as? NSNumber).map({ CGFloat(truncating: $0) }) {
+                        self.applyMeasuredHeight(height, of: view, at: i)
+                    } else {
+                        self.measureContentHeight(of: view, at: i)
+                    }
                 }
             }
         }
@@ -211,50 +239,77 @@ final class EPUBInfiniteScrollView: UIScrollView {
         (function() {
             var b = document.body;
             if (!b) return 0;
+            function intrinsicHeight() {
+                var rect = b.getBoundingClientRect();
+                var cs = getComputedStyle(b);
+                return Math.ceil(rect.height
+                    + (parseFloat(cs.marginTop) || 0)
+                    + (parseFloat(cs.marginBottom) || 0));
+            }
+            function reportHeight() {
+                try {
+                    webkit.messageHandlers.bodyResized.postMessage(intrinsicHeight());
+                } catch (e) {}
+            }
             if (!window.__rdrResizeObs__ && window.ResizeObserver) {
-                window.__rdrResizeObs__ = new ResizeObserver(function() {
-                    try { webkit.messageHandlers.bodyResized.postMessage(b.scrollHeight); } catch (e) {}
-                });
+                window.__rdrResizeObs__ = new ResizeObserver(reportHeight);
                 window.__rdrResizeObs__.observe(b);
             }
-            var cs = getComputedStyle(b);
-            return Math.ceil(b.scrollHeight
-                + (parseFloat(cs.marginTop) || 0)
-                + (parseFloat(cs.marginBottom) || 0));
+            if (!window.__rdrFontsObserved__ && document.fonts) {
+                window.__rdrFontsObserved__ = true;
+                document.fonts.ready.then(reportHeight);
+                document.fonts.addEventListener("loadingdone", reportHeight);
+            }
+            return intrinsicHeight();
         })()
         """
         view.webView.evaluateJavaScript(js) { [weak self, weak view] result, _ in
-            // Threshold only filters pre-render readings (body missing → 0).
-            // Real chapters can be tiny (e.g., a 70px separator page), so keep it low.
-            guard let height = (result as? NSNumber).map({ CGFloat(truncating: $0) }),
-                  height > 20 else { return }
-
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                guard self.resolvedHeights[index] != height else { return }
-                let oldHeight = self.resolvedHeights[index] ?? self.placeholderHeight
-                let delta = height - oldHeight
-                self.resolvedHeights[index] = height
-                view?.frame.size.height = height
-                self.setNeedsLayout()
-                self.layoutIfNeeded()
-                // Compensate so the viewport doesn't jump when a chapter above the
-                // current reading position resolves with a different height.
-                if index < self.currentIndex && delta != 0 {
-                    var offset = self.contentOffset
-                    offset.y += delta
-                    self.contentOffset = offset
-                }
-
-                // Verification pass: a measurement can land mid-reflow (CSS injection,
-                // font loading) and the final resize may slip past the ResizeObserver.
-                // Re-measure after the layout settles; a stable height is a no-op,
-                // so this cannot loop.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self, weak view] in
-                    guard let self, let view, self.loadedViews[index] === view else { return }
-                    self.measureContentHeight(of: view, at: index)
-                }
+                guard
+                    let self,
+                    let view,
+                    let height = (result as? NSNumber).map({ CGFloat(truncating: $0) })
+                else { return }
+                self.applyMeasuredHeight(height, of: view, at: index)
             }
+        }
+    }
+
+    private func applyMeasuredHeight(_ measuredHeight: CGFloat, of view: EPUBSpreadView, at index: Int) {
+        // Threshold only filters pre-render readings (body missing -> 0).
+        // Real resources can be tiny (for example, a separator page).
+        let height = ceil(measuredHeight)
+        guard
+            height > 20,
+            loadedViews[index] === view,
+            chapterHeights.indices.contains(index),
+            resolvedHeights[index] != height
+        else { return }
+
+        let anchorIndex = self.index(at: contentOffset.y + 1)
+        resolvedHeights[index] = height
+        guard let delta = setHeight(height, at: index) else { return }
+
+        isUpdatingGeometry = true
+        setNeedsLayout()
+        layoutIfNeeded()
+
+        // Preserve the same document pixel when a resource above the viewport
+        // resolves. The current resource needs no correction: its DOM origin
+        // remains fixed while its frame grows or shrinks around the content.
+        if index < anchorIndex, delta != 0 {
+            var offset = contentOffset
+            offset.y = max(0, offset.y + delta)
+            contentOffset = offset
+        }
+        isUpdatingGeometry = false
+        refreshCurrentIndex()
+
+        // A measurement can land mid-reflow (CSS injection or font loading).
+        // A stable verification pass is a no-op and cannot loop.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self, weak view] in
+            guard let self, let view, self.loadedViews[index] === view else { return }
+            self.measureContentHeight(of: view, at: index)
         }
     }
 
@@ -262,18 +317,71 @@ final class EPUBInfiniteScrollView: UIScrollView {
         loadedViews.values.forEach { $0.removeFromSuperview() }
         loadedViews.removeAll()
         resolvedHeights.removeAll()
+        chapterHeights.removeAll()
+        chapterOffsets = [0]
         heightObservations.removeAll()
     }
 
     // MARK: - Geometry
 
     private func height(for index: Int) -> CGFloat {
-        resolvedHeights[index] ?? placeholderHeight
+        guard chapterHeights.indices.contains(index) else {
+            return placeholderHeight
+        }
+        return chapterHeights[index]
     }
 
     /// Returns the Y offset of the top of chapter `index`.
     func yOffset(for index: Int) -> CGFloat {
-        (0 ..< index).reduce(0) { $0 + height(for: $1) }
+        guard chapterOffsets.indices.contains(index) else {
+            return chapterOffsets.last ?? 0
+        }
+        return chapterOffsets[index]
+    }
+
+    private func resetHeightIndex() {
+        chapterHeights = Array(repeating: placeholderHeight, count: chapterCount)
+        rebuildOffsets()
+    }
+
+    private func rebuildOffsets() {
+        chapterOffsets = [0]
+        chapterOffsets.reserveCapacity(chapterHeights.count + 1)
+        for height in chapterHeights {
+            chapterOffsets.append((chapterOffsets.last ?? 0) + height)
+        }
+    }
+
+    /// Updates one resource height and rebuilds the prefix index.
+    ///
+    /// Internal so the geometry can be covered without constructing WebViews.
+    @discardableResult
+    func setHeight(_ height: CGFloat, at index: Int) -> CGFloat? {
+        guard height > 0, chapterHeights.indices.contains(index) else {
+            return nil
+        }
+        let delta = height - chapterHeights[index]
+        chapterHeights[index] = height
+        rebuildOffsets()
+        return delta
+    }
+
+    /// Returns the resource whose vertical interval contains `y`.
+    func index(at y: CGFloat) -> Int {
+        guard chapterCount > 0 else { return 0 }
+        let target = max(0, min(y, max(0, (chapterOffsets.last ?? 0) - 1)))
+        var lower = 0
+        var upper = chapterCount
+
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if chapterOffsets[middle + 1] <= target {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        return min(lower, chapterCount - 1)
     }
 
     private func scrollToChapter(_ index: Int, location: PageLocation, animated: Bool) {
@@ -298,34 +406,18 @@ final class EPUBInfiniteScrollView: UIScrollView {
     // MARK: - Current Index Tracking
 
     private func refreshCurrentIndex() {
-        guard chapterCount > 0 else { return }
-
-        let centerY = contentOffset.y + bounds.height / 2
-        // Only scan the loaded window — no need to iterate all chapters
-        let lo = loadedViews.keys.min() ?? 0
-        let hi = loadedViews.keys.max() ?? 0
-
-        var bestIndex = currentIndex
-        var bestDist = CGFloat.infinity
-
-        for i in lo ... hi {
-            let top = yOffset(for: i)
-            let h = height(for: i)
-            let dist = abs(centerY - (top + h / 2))
-            if dist < bestDist {
-                bestDist = dist
-                bestIndex = i
-            }
-        }
-
-        guard bestIndex != currentIndex else { return }
-        currentIndex = bestIndex
+        guard chapterCount > 0, !isUpdatingGeometry else { return }
+        let visibleIndex = index(at: contentOffset.y + 1)
+        guard visibleIndex != currentIndex else { return }
+        currentIndex = visibleIndex
         updateWindow()
     }
 }
 
 extension EPUBInfiniteScrollView: UIScrollViewDelegate {
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        guard !isUpdatingGeometry else { return }
         refreshCurrentIndex()
+        infiniteDelegate?.infiniteScrollViewDidScroll(self)
     }
 }

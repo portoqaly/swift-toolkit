@@ -1390,4 +1390,8 @@ extension EPUBNavigatorViewController: EPUBInfiniteScrollViewDelegate {
     func infiniteScrollViewDidUpdateViews(_ view: EPUBInfiniteScrollView) {
         updateCurrentLocation()
     }
+
+    func infiniteScrollViewDidScroll(_ view: EPUBInfiniteScrollView) {
+        updateCurrentLocation()
+    }
 }
