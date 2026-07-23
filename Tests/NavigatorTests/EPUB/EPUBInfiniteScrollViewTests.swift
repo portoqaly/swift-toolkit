@@ -56,12 +56,36 @@ struct EPUBInfiniteScrollViewTests {
         #expect(view.index(at: .greatestFiniteMagnitude) == 3)
     }
 
-    @Test("a fast fling can activate a resource outside the loaded window")
-    func fastFlingActivatesUnloadedResource() {
+    @Test("a fast fling cannot skip across unresolved resources")
+    func fastFlingStopsAtLoadingBoundary() {
         let view = makeView()
         view.contentOffset.y = 80 * 800 + 10
         view.scrollViewDidScroll(view)
 
-        #expect(view.currentIndex == 80)
+        #expect(view.currentIndex == 0)
+        #expect(view.contentOffset.y == 0)
+    }
+
+    @Test("the loading window has a hard WebView-count bound")
+    func loadingWindowIsBounded() {
+        let view = makeView()
+        for index in 0 ..< 100 {
+            view.setHeight(40, at: index)
+        }
+
+        let range = view.loadingRange(around: 50)
+        #expect(range.count == EPUBInfiniteScrollView.maximumLoadedResourceCount)
+        #expect(range == 44 ... 56)
+    }
+
+    @Test("visible progressions include every resource crossing the viewport")
+    func visibleProgressionRanges() {
+        let view = makeView(chapterCount: 3)
+        view.setHeight(200, at: 0)
+        view.setHeight(1200, at: 1)
+
+        #expect(view.visibleReadingOrderRange == 0 ... 1)
+        #expect(view.progression(in: 0) == 0 ... 1)
+        #expect(view.progression(in: 1) == 0 ... 0.5)
     }
 }

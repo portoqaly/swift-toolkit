@@ -728,12 +728,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         if let isv = infiniteScrollView {
-            let index = isv.currentIndex
-            guard index < readingOrder.count else { return (nil, nil) }
-            let progression = isv.progressionInCurrentChapter
+            let range = isv.visibleReadingOrderRange
+            guard range.upperBound < readingOrder.count else { return (nil, nil) }
             let (locator, viewport) = await EPUBViewportAndLocationCalculator.compute(
-                readingOrderIndices: index ... index,
-                progression: { _ in progression ... progression },
+                readingOrderIndices: range,
+                progression: { isv.progression(in: $0) },
                 readingOrder: readingOrder,
                 positionsByReadingOrder: positionsByReadingOrder,
                 tableOfContentsTitleByHref: tableOfContentsTitleByHref,
@@ -759,7 +758,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     public func firstVisibleElementLocator() async -> Locator? {
         if let isv = infiniteScrollView {
-            return await isv.currentView?.findFirstVisibleElementLocator()
+            guard let view = isv.currentView else { return nil }
+            return await view.findFirstVisibleElementLocator(
+                verticalOffset: isv.visibleOffset(in: isv.currentIndex),
+                viewportHeight: isv.bounds.height
+            )
         }
         guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
             return nil
@@ -1290,6 +1293,8 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
             return
         }
 
+        let frame = frame.map { view.convert($0, from: spreadView) }
+        let point = point.map { view.convert($0, from: spreadView) }
         for callback in callbacks {
             callback(OnDecorationActivatedEvent(decoration: decoration, group: group, rect: frame, point: point))
         }
@@ -1297,15 +1302,27 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
 
     func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect) {
         guard
-            let locator = currentLocation,
             let text = text
         else {
             viewModel.editingActions.selection = nil
             return
         }
+
+        let link = spreadView.spread.first.link
+        let href = link.url()
+        let locator: Locator
+        if let currentLocation, currentLocation.href.isEquivalentTo(href) {
+            locator = currentLocation
+        } else {
+            locator = Locator(
+                href: href,
+                mediaType: link.mediaType ?? .xhtml
+            )
+        }
+
         viewModel.editingActions.selection = Selection(
             locator: locator.copy(text: { $0 = text }),
-            frame: frame
+            frame: view.convert(frame, from: spreadView)
         )
     }
 

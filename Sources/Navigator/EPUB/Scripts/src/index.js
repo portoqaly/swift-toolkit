@@ -8,7 +8,10 @@
 
 import "./gestures";
 import "./keyboard";
-import { findFirstVisibleLocator } from "./dom";
+import {
+  findFirstVisibleLocator,
+  findFirstVisibleLocatorInViewport,
+} from "./dom";
 import {
   removeProperty,
   scrollLeft,
@@ -16,6 +19,7 @@ import {
   scrollToId,
   scrollToPosition,
   scrollToLocator,
+  verticalOffsetForLocator,
   setProperty,
   setCSSProperties,
 } from "./utils";
@@ -27,6 +31,7 @@ global.readium = {
   scrollToId: scrollToId,
   scrollToPosition: scrollToPosition,
   scrollToLocator: scrollToLocator,
+  verticalOffsetForLocator: verticalOffsetForLocator,
   scrollLeft: scrollLeft,
   scrollRight: scrollRight,
   setCSSProperties: setCSSProperties,
@@ -39,4 +44,5 @@ global.readium = {
 
   // DOM
   findFirstVisibleLocator: findFirstVisibleLocator,
+  findFirstVisibleLocatorInViewport: findFirstVisibleLocatorInViewport,
 };

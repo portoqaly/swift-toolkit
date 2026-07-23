@@ -214,6 +214,18 @@ export function scrollToLocator(locator, animated) {
   return scrollToRange(range, animated);
 }
 
+/// Returns the vertical document offset matching a locator without scrolling.
+///
+/// Used by the native continuous-scroll container, which owns the actual
+/// content offset while the resource WebView remains fully expanded.
+export function verticalOffsetForLocator(locator) {
+  let range = rangeFromLocator(locator);
+  if (!range) {
+    return null;
+  }
+  return range.getBoundingClientRect().top + window.scrollY;
+}
+
 function scrollToRange(range, animated) {
   return scrollToRect(range.getBoundingClientRect(), animated);
 }

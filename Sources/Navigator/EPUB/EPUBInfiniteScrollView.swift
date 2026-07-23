@@ -26,7 +26,6 @@ protocol EPUBInfiniteScrollViewDelegate: AnyObject {
 /// heights are used until each chapter's WebView reports its actual content height.
 @MainActor
 final class EPUBInfiniteScrollView: UIScrollView {
-
     weak var infiniteDelegate: EPUBInfiniteScrollViewDelegate?
 
     private(set) var chapterCount: Int = 0
@@ -51,6 +50,12 @@ final class EPUBInfiniteScrollView: UIScrollView {
     /// Chapters to preload on each side of the current one.
     private let preloadWindow = 2
 
+    /// Hard upper bound for simultaneously retained resource WebViews.
+    ///
+    /// The pixel preload budget is useful for long chapters, but a book made
+    /// of many tiny resources must not turn it into an unbounded WebView count.
+    static let maximumLoadedResourceCount = 13
+
     /// Estimate used before a chapter's actual height is known.
     ///
     /// One viewport is deliberately conservative: it gives an unresolved
@@ -63,6 +68,26 @@ final class EPUBInfiniteScrollView: UIScrollView {
     /// Prevents geometry corrections from recursively changing the active
     /// resource while `contentOffset` is being compensated.
     private var isUpdatingGeometry = false
+
+    /// Prevents user-scroll loading guards from intercepting explicit locator
+    /// navigation and geometry compensation.
+    private var isProgrammaticNavigation = false
+    private var isClampingUserScroll = false
+    private var lastContentOffsetY: CGFloat = 0
+
+    private struct PendingNavigation {
+        let id = UUID()
+        let index: Int
+        let location: PageLocation
+        let animated: Bool
+        let completion: ((Bool) -> Void)?
+    }
+
+    /// Locator navigation waits for the destination DOM and intrinsic height.
+    /// This is required for CSS selectors, fragments, and text-quote anchors;
+    /// a placeholder-height percentage is not an exact destination.
+    private var pendingNavigation: PendingNavigation?
+    private var pendingNavigationTimeout: Task<Void, Never>?
 
     // MARK: - Init
 
@@ -91,25 +116,38 @@ final class EPUBInfiniteScrollView: UIScrollView {
 
     /// Resets the view to display `count` chapters, positioning at `index`.
     func reload(at index: Int, location: PageLocation, count: Int) {
+        cancelPendingNavigation()
         chapterCount = max(0, count)
         evictAll()
         guard chapterCount > 0 else { return }
         resetHeightIndex()
         currentIndex = max(0, min(index, chapterCount - 1))
-        updateWindow(movingTo: location)
+        updateWindow()
+        requestNavigation(to: currentIndex, location: location, animated: false)
     }
 
     /// Scrolls (or jumps) to the chapter at `index`, positioning at `location`.
     func goToIndex(_ index: Int, location: PageLocation, options: NavigatorGoOptions) async -> Bool {
         guard 0 ..< chapterCount ~= index else { return false }
+        cancelPendingNavigation()
         currentIndex = index
         let animated = options.animated && !UIAccessibility.isReduceMotionEnabled
-        updateWindow(movingTo: location, animated: animated)
-        return true
+        updateWindow()
+
+        return await withCheckedContinuation { continuation in
+            requestNavigation(
+                to: index,
+                location: location,
+                animated: animated,
+                completion: { continuation.resume(returning: $0) }
+            )
+        }
     }
 
     /// The spread view for the chapter currently in focus, if loaded.
-    var currentView: EPUBSpreadView? { loadedViews[currentIndex] }
+    var currentView: EPUBSpreadView? {
+        loadedViews[currentIndex]
+    }
 
     /// Re-measures a resource once Readium has finished loading and applying
     /// its decoration scripts.
@@ -127,10 +165,33 @@ final class EPUBInfiniteScrollView: UIScrollView {
 
     /// Vertical scroll progression within the current chapter (0–1).
     var progressionInCurrentChapter: Double {
-        let top = yOffset(for: currentIndex)
-        let h = height(for: currentIndex)
-        guard h > 0 else { return 0 }
-        return min(1, max(0, Double((contentOffset.y - top) / h)))
+        progression(in: currentIndex).lowerBound
+    }
+
+    /// Reading-order resources intersecting the native viewport.
+    var visibleReadingOrderRange: ClosedRange<Int> {
+        guard chapterCount > 0 else { return 0 ... 0 }
+        let first = index(at: contentOffset.y + 1)
+        let last = index(at: contentOffset.y + max(1, bounds.height) - 1)
+        return min(first, last) ... max(first, last)
+    }
+
+    /// Visible progression range within one resource.
+    func progression(in index: Int) -> ClosedRange<Double> {
+        let top = yOffset(for: index)
+        let resourceHeight = height(for: index)
+        guard resourceHeight > 0 else { return 0 ... 0 }
+
+        let viewportTop = contentOffset.y
+        let viewportBottom = contentOffset.y + bounds.height
+        let first = min(1, max(0, Double((viewportTop - top) / resourceHeight)))
+        let last = min(1, max(first, Double((viewportBottom - top) / resourceHeight)))
+        return first ... last
+    }
+
+    /// Offset of the visible viewport within `index`, used for DOM locators.
+    func visibleOffset(in index: Int) -> CGFloat {
+        max(0, contentOffset.y - yOffset(for: index))
     }
 
     // MARK: - Layout
@@ -145,38 +206,17 @@ final class EPUBInfiniteScrollView: UIScrollView {
             loadedViews[i]?.frame = CGRect(x: 0, y: yOffset(for: i), width: w, height: h)
         }
         contentSize = CGSize(width: w, height: chapterOffsets.last ?? 0)
+        updateAccessibilityVisibility()
     }
 
     // MARK: - Window Management
 
-    private func updateWindow(movingTo location: PageLocation? = nil, animated: Bool = false) {
+    private func updateWindow() {
         guard chapterCount > 0 else { return }
 
-        // Pixel-based window: chapters can be tiny (a 70px separator page) or huge
-        // (a 15000px chapter), so a fixed chapter count either wastes memory or
-        // lets the user scroll past the preloaded content and hit spinners.
-        // Extend the window until it covers `preloadDistance` px in each direction,
-        // with `preloadWindow` chapters as the minimum.
-        let preloadDistance = max(bounds.height * 3, 2000)
-
-        var lo = max(0, currentIndex - preloadWindow)
-        var acc: CGFloat = (lo ..< currentIndex).reduce(0) { $0 + height(for: $1) }
-        while lo > 0, acc < preloadDistance {
-            lo -= 1
-            acc += height(for: lo)
-        }
-
-        var hi = min(chapterCount - 1, currentIndex + preloadWindow)
-        acc = 0
-        if hi > currentIndex {
-            for i in (currentIndex + 1) ... hi {
-                acc += height(for: i)
-            }
-        }
-        while hi < chapterCount - 1, acc < preloadDistance {
-            hi += 1
-            acc += height(for: hi)
-        }
+        let range = loadingRange(around: currentIndex)
+        let lo = range.lowerBound
+        let hi = range.upperBound
 
         // Evict out-of-window chapters
         for i in loadedViews.keys where !(lo ... hi ~= i) {
@@ -211,11 +251,42 @@ final class EPUBInfiniteScrollView: UIScrollView {
         setNeedsLayout()
         layoutIfNeeded()
 
-        if let location {
-            scrollToChapter(currentIndex, location: location, animated: animated)
+        infiniteDelegate?.infiniteScrollViewDidUpdateViews(self)
+    }
+
+    /// Computes the pixel-budgeted, count-bounded loading window.
+    ///
+    /// Internal so memory behavior can be verified without constructing
+    /// WebViews in unit tests.
+    func loadingRange(around index: Int) -> ClosedRange<Int> {
+        guard chapterCount > 0 else { return 0 ... 0 }
+
+        let center = max(0, min(index, chapterCount - 1))
+        let preloadDistance = max(bounds.height * 3, 2000)
+        let maximumSideCount = (Self.maximumLoadedResourceCount - 1) / 2
+
+        let minimumLowerBound = max(0, center - maximumSideCount)
+        var lo = max(minimumLowerBound, center - preloadWindow)
+        var distance: CGFloat = (lo ..< center).reduce(0) { $0 + height(for: $1) }
+        while lo > minimumLowerBound, distance < preloadDistance {
+            lo -= 1
+            distance += height(for: lo)
         }
 
-        infiniteDelegate?.infiniteScrollViewDidUpdateViews(self)
+        let maximumUpperBound = min(chapterCount - 1, center + maximumSideCount)
+        var hi = min(maximumUpperBound, center + preloadWindow)
+        distance = 0
+        if hi > center {
+            for i in (center + 1) ... hi {
+                distance += height(for: i)
+            }
+        }
+        while hi < maximumUpperBound, distance < preloadDistance {
+            hi += 1
+            distance += height(for: hi)
+        }
+
+        return lo ... hi
     }
 
     /// Disables the WebView's own scrolling so the outer scroll handles everything.
@@ -349,6 +420,7 @@ final class EPUBInfiniteScrollView: UIScrollView {
         }
         isUpdatingGeometry = false
         refreshCurrentIndex()
+        resumePendingNavigationIfReady(for: index)
 
         // A measurement can land mid-reflow (CSS injection or font loading).
         // A stable verification pass is a no-op and cannot loop.
@@ -365,6 +437,121 @@ final class EPUBInfiniteScrollView: UIScrollView {
         chapterHeights.removeAll()
         chapterOffsets = [0]
         heightObservations.removeAll()
+    }
+
+    // MARK: - Navigation
+
+    private func requestNavigation(
+        to index: Int,
+        location: PageLocation,
+        animated: Bool,
+        completion: ((Bool) -> Void)? = nil
+    ) {
+        let navigation = PendingNavigation(
+            index: index,
+            location: location,
+            animated: animated,
+            completion: completion
+        )
+        pendingNavigation = navigation
+        resumePendingNavigationIfReady(for: index)
+
+        guard pendingNavigation?.id == navigation.id else { return }
+        pendingNavigationTimeout = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 10_000_000_000)
+            } catch {
+                return
+            }
+            guard let self, self.pendingNavigation?.id == navigation.id else { return }
+            self.pendingNavigation = nil
+            self.pendingNavigationTimeout = nil
+            navigation.completion?(false)
+        }
+    }
+
+    private func resumePendingNavigationIfReady(for index: Int) {
+        guard
+            let navigation = pendingNavigation,
+            navigation.index == index,
+            canResolve(navigation.location, at: index)
+        else { return }
+
+        Task { [weak self] in
+            await self?.completePendingNavigation(id: navigation.id)
+        }
+    }
+
+    private func canResolve(_ location: PageLocation, at index: Int) -> Bool {
+        switch location {
+        case .start:
+            return true
+        case .end, .locator:
+            return resolvedHeights[index] != nil
+                && loadedViews[index]?.isSpreadLoaded == true
+        }
+    }
+
+    private func completePendingNavigation(id: UUID) async {
+        guard let navigation = pendingNavigation, navigation.id == id else { return }
+        let targetY = await targetOffset(
+            for: navigation.location,
+            at: navigation.index
+        )
+        guard pendingNavigation?.id == id else { return }
+
+        pendingNavigation = nil
+        pendingNavigationTimeout?.cancel()
+        pendingNavigationTimeout = nil
+        performProgrammaticScroll(to: targetY, animated: navigation.animated)
+        navigation.completion?(true)
+    }
+
+    private func targetOffset(for location: PageLocation, at index: Int) async -> CGFloat {
+        let top = yOffset(for: index)
+        let resourceHeight = height(for: index)
+        let targetY: CGFloat
+
+        switch location {
+        case .start:
+            targetY = top
+
+        case .end:
+            targetY = top + resourceHeight - bounds.height
+
+        case let .locator(locator):
+            if
+                let view = loadedViews[index],
+                let offset = await view.verticalOffset(for: locator)
+            {
+                targetY = top + offset
+            } else {
+                let progression = locator.locations.progression ?? 0
+                targetY = top + resourceHeight * CGFloat(progression)
+            }
+        }
+
+        let maxY = max(0, contentSize.height - bounds.height)
+        return min(max(0, targetY), maxY)
+    }
+
+    private func performProgrammaticScroll(to targetY: CGFloat, animated: Bool) {
+        let target = CGPoint(x: 0, y: targetY)
+        let willAnimate = animated && abs(contentOffset.y - targetY) > 0.5
+        isProgrammaticNavigation = true
+        setContentOffset(target, animated: willAnimate)
+        if !willAnimate {
+            isProgrammaticNavigation = false
+        }
+        lastContentOffsetY = targetY
+    }
+
+    private func cancelPendingNavigation() {
+        let completion = pendingNavigation?.completion
+        pendingNavigation = nil
+        pendingNavigationTimeout?.cancel()
+        pendingNavigationTimeout = nil
+        completion?(false)
     }
 
     // MARK: - Geometry
@@ -429,25 +616,6 @@ final class EPUBInfiniteScrollView: UIScrollView {
         return min(lower, chapterCount - 1)
     }
 
-    private func scrollToChapter(_ index: Int, location: PageLocation, animated: Bool) {
-        let top = yOffset(for: index)
-        let h = height(for: index)
-        let targetY: CGFloat
-
-        switch location {
-        case .start:
-            targetY = top
-        case .end:
-            targetY = max(0, top + h - bounds.height)
-        case .locator(let locator):
-            let p = locator.locations.progression ?? 0
-            targetY = top + h * CGFloat(p)
-        }
-
-        let maxY = max(0, contentSize.height - bounds.height)
-        setContentOffset(CGPoint(x: 0, y: min(max(0, targetY), maxY)), animated: animated)
-    }
-
     // MARK: - Current Index Tracking
 
     private func refreshCurrentIndex() {
@@ -457,12 +625,108 @@ final class EPUBInfiniteScrollView: UIScrollView {
         currentIndex = visibleIndex
         updateWindow()
     }
+
+    /// Stops a gesture at the first unresolved resource instead of letting a
+    /// fling travel through placeholder geometry for the whole publication.
+    private func clampUserScrollIfNeeded() -> Bool {
+        guard
+            !isUpdatingGeometry,
+            !isProgrammaticNavigation,
+            !isClampingUserScroll,
+            chapterCount > 0
+        else { return false }
+
+        let y = contentOffset.y
+        let targetIndex = index(at: y + 1)
+        let movingDown = y > lastContentOffsetY
+        let blocker: Int?
+
+        if movingDown {
+            if resolvedHeights[currentIndex] == nil {
+                blocker = currentIndex
+            } else if targetIndex > currentIndex {
+                blocker = ((currentIndex + 1) ... targetIndex)
+                    .first { resolvedHeights[$0] == nil }
+            } else {
+                blocker = nil
+            }
+        } else if targetIndex < currentIndex {
+            blocker = (targetIndex ..< currentIndex)
+                .reversed()
+                .first { resolvedHeights[$0] == nil }
+        } else {
+            blocker = nil
+        }
+
+        guard let blocker else { return false }
+
+        let clampedY: CGFloat = movingDown
+            ? yOffset(for: blocker)
+            : max(0, yOffset(for: blocker + 1) - bounds.height)
+
+        isClampingUserScroll = true
+        contentOffset.y = clampedY
+        currentIndex = blocker
+        updateWindow()
+        isClampingUserScroll = false
+        lastContentOffsetY = clampedY
+        return true
+    }
+
+    private func updateAccessibilityVisibility() {
+        let accessibilityRect = CGRect(
+            x: 0,
+            y: contentOffset.y - bounds.height,
+            width: bounds.width,
+            height: bounds.height * 3
+        )
+        for view in loadedViews.values {
+            view.accessibilityElementsHidden = !view.frame.intersects(accessibilityRect)
+        }
+    }
+
+    override func accessibilityScroll(_ direction: UIAccessibilityScrollDirection) -> Bool {
+        let delta: CGFloat
+        switch direction {
+        case .down:
+            delta = bounds.height
+        case .up:
+            delta = -bounds.height
+        default:
+            return super.accessibilityScroll(direction)
+        }
+
+        let oldY = contentOffset.y
+        let maxY = max(0, contentSize.height - bounds.height)
+        let newY = min(max(0, oldY + delta), maxY)
+        guard abs(newY - oldY) > 0.5 else { return false }
+
+        setContentOffset(CGPoint(x: 0, y: newY), animated: !UIAccessibility.isReduceMotionEnabled)
+        UIAccessibility.post(notification: .pageScrolled, argument: nil)
+        return true
+    }
 }
 
 extension EPUBInfiniteScrollView: UIScrollViewDelegate {
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        guard !isUpdatingGeometry else { return }
+        guard !isUpdatingGeometry, !isClampingUserScroll else { return }
+        if clampUserScrollIfNeeded() {
+            infiniteDelegate?.infiniteScrollViewDidScroll(self)
+            return
+        }
         refreshCurrentIndex()
+        updateAccessibilityVisibility()
+        lastContentOffsetY = contentOffset.y
         infiniteDelegate?.infiniteScrollViewDidScroll(self)
+    }
+
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        isProgrammaticNavigation = false
+        lastContentOffsetY = contentOffset.y
+    }
+
+    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+        isProgrammaticNavigation = false
+        lastContentOffsetY = contentOffset.y
     }
 }

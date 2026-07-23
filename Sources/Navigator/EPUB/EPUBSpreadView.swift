@@ -503,7 +503,45 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     }
 
     func findFirstVisibleElementLocator() async -> Locator? {
-        let result = await evaluateScript("readium.findFirstVisibleLocator()")
+        await findFirstVisibleElementLocator(
+            evaluating: "readium.findFirstVisibleLocator()"
+        )
+    }
+
+    /// Finds the first element visible in a native continuous-scroll viewport.
+    ///
+    /// The resource WebView is expanded to its full document height in this
+    /// mode, so its own `window.scrollY` cannot describe what the user sees.
+    func findFirstVisibleElementLocator(
+        verticalOffset: CGFloat,
+        viewportHeight: CGFloat
+    ) async -> Locator? {
+        let top = max(0, verticalOffset)
+        let height = max(1, viewportHeight)
+        return await findFirstVisibleElementLocator(
+            evaluating: "readium.findFirstVisibleLocatorInViewport(\(top), \(height))"
+        )
+    }
+
+    /// Resolves a text, CSS-selector, or fragment locator to a document Y
+    /// coordinate without moving the resource's internal scroll view.
+    func verticalOffset(for locator: Locator) async -> CGFloat? {
+        guard let json = try? locator.jsonString() else {
+            return nil
+        }
+        let result = await evaluateScript("readium.verticalOffsetForLocator(\(json))")
+
+        switch result {
+        case let .success(value):
+            return (value as? NSNumber).map { CGFloat(truncating: $0) }
+        case let .failure(error):
+            log(.error, error)
+            return nil
+        }
+    }
+
+    private func findFirstVisibleElementLocator(evaluating script: String) async -> Locator? {
+        let result = await evaluateScript(script)
         do {
             let link = spread.first.link
 

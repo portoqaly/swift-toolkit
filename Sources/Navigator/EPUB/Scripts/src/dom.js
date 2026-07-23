@@ -53,7 +53,20 @@ export function findNearestInteractiveElement(element) {
 /// Returns the `Locator` object to the first block element that is visible on
 /// the screen.
 export function findFirstVisibleLocator() {
-  const element = findElement(document.body);
+  return findFirstVisibleLocatorInViewport(0, window.innerHeight);
+}
+
+/// Returns the first block element intersecting an explicit vertical viewport.
+///
+/// Continuous scroll keeps each resource's WebView fully expanded and scrolls
+/// a native parent view, so `window.scrollY` is always zero. Native code passes
+/// the visible slice of the resource to preserve element-level locators.
+export function findFirstVisibleLocatorInViewport(top, height) {
+  const viewport = {
+    top: Math.max(0, top),
+    bottom: Math.max(0, top) + Math.max(1, height),
+  };
+  const element = findElement(document.body, viewport);
   return {
     href: "#",
     type: "application/xhtml+xml",
@@ -66,17 +79,17 @@ export function findFirstVisibleLocator() {
   };
 }
 
-function findElement(rootElement) {
+function findElement(rootElement, viewport) {
   for (var i = 0; i < rootElement.children.length; i++) {
     const child = rootElement.children[i];
-    if (!shouldIgnoreElement(child) && isElementVisible(child)) {
-      return findElement(child);
+    if (!shouldIgnoreElement(child) && isElementVisible(child, viewport)) {
+      return findElement(child, viewport);
     }
   }
   return rootElement;
 }
 
-function isElementVisible(element) {
+function isElementVisible(element, viewport) {
   if (readium.isFixedLayout) return true;
 
   if (element === document.body || element === document.documentElement) {
@@ -87,6 +100,9 @@ function isElementVisible(element) {
   }
 
   const rect = element.getBoundingClientRect();
+  if (viewport) {
+    return rect.bottom > viewport.top && rect.top < viewport.bottom;
+  }
   if (isScrollModeEnabled()) {
     return rect.bottom > 0 && rect.top < window.innerHeight;
   } else {

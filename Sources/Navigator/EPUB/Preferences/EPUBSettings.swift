@@ -133,9 +133,15 @@ public struct EPUBSettings: ConfigurableSettings {
             ?? language?.verticalText(for: readingProgression)
             ?? false
 
-        let infiniteScroll = preferences.infiniteScroll
+        let requestedInfiniteScroll = preferences.infiniteScroll
             ?? defaults.infiniteScroll
             ?? false
+        // Publication-wide continuous scrolling is only valid for horizontal
+        // reflowable content. Fixed layout keeps its page geometry, while
+        // vertical writing uses the existing per-resource horizontal scroller.
+        let infiniteScroll = requestedInfiniteScroll
+            && metadata.epubLayout == .reflowable
+            && !verticalText
 
         var scroll = preferences.scroll
             ?? defaults.scroll

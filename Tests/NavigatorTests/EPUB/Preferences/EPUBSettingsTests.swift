@@ -79,6 +79,34 @@ class EPUBSettingsTests: XCTestCase {
         )
     }
 
+    func testInfiniteScrollOnlyResolvesForHorizontalReflowableContent() {
+        let preferences = EPUBPreferences(infiniteScroll: true)
+
+        let reflowable = EPUBSettings(
+            preferences: preferences,
+            defaults: EPUBDefaults(),
+            metadata: Metadata(title: "Reflowable")
+        )
+        XCTAssertTrue(reflowable.infiniteScroll)
+        XCTAssertTrue(reflowable.scroll)
+
+        let fixed = EPUBSettings(
+            preferences: preferences,
+            defaults: EPUBDefaults(),
+            metadata: Metadata(title: "Fixed", layout: .fixed)
+        )
+        XCTAssertFalse(fixed.infiniteScroll)
+        XCTAssertFalse(fixed.scroll)
+
+        let vertical = EPUBSettings(
+            preferences: EPUBPreferences(infiniteScroll: true, verticalText: true),
+            defaults: EPUBDefaults(),
+            metadata: Metadata(title: "Vertical")
+        )
+        XCTAssertFalse(vertical.infiniteScroll)
+        XCTAssertTrue(vertical.scroll)
+    }
+
     func testComputeLayoutWithLTRReadingProgression() {
         XCTAssertEqual(
             resolveLayout(readingProgression: .ltr),
