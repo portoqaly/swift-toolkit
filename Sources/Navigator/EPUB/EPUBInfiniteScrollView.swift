@@ -111,6 +111,20 @@ final class EPUBInfiniteScrollView: UIScrollView {
     /// The spread view for the chapter currently in focus, if loaded.
     var currentView: EPUBSpreadView? { loadedViews[currentIndex] }
 
+    /// Re-measures a resource once Readium has finished loading and applying
+    /// its decoration scripts.
+    ///
+    /// `WKWebView.scrollView.contentSize` is not a reliable initial signal in
+    /// this layout because the web view already has its placeholder frame by
+    /// the time observation starts. The explicit load callback guarantees that
+    /// every materialized resource gets one measurement with a ready DOM.
+    func spreadViewDidLoad(_ spreadView: EPUBSpreadView) {
+        guard
+            let index = loadedViews.first(where: { $0.value === spreadView })?.key
+        else { return }
+        measureContentHeight(of: spreadView, at: index)
+    }
+
     /// Vertical scroll progression within the current chapter (0–1).
     var progressionInCurrentChapter: Double {
         let top = yOffset(for: currentIndex)
@@ -240,9 +254,22 @@ final class EPUBInfiniteScrollView: UIScrollView {
             var b = document.body;
             if (!b) return 0;
             function intrinsicHeight() {
-                var rect = b.getBoundingClientRect();
+                var bodyRect = b.getBoundingClientRect();
                 var cs = getComputedStyle(b);
-                return Math.ceil(rect.height
+                var top = bodyRect.top;
+                var bottom = top;
+                var range = document.createRange();
+                range.selectNodeContents(b);
+                Array.prototype.forEach.call(range.getClientRects(), function(rect) {
+                    bottom = Math.max(bottom, rect.bottom);
+                });
+                Array.prototype.forEach.call(b.children, function(child) {
+                    Array.prototype.forEach.call(child.getClientRects(), function(rect) {
+                        bottom = Math.max(bottom, rect.bottom);
+                    });
+                });
+                return Math.ceil(Math.max(0, bottom - top)
+                    + (parseFloat(cs.paddingBottom) || 0)
                     + (parseFloat(cs.marginTop) || 0)
                     + (parseFloat(cs.marginBottom) || 0));
             }
@@ -254,6 +281,24 @@ final class EPUBInfiniteScrollView: UIScrollView {
             if (!window.__rdrResizeObs__ && window.ResizeObserver) {
                 window.__rdrResizeObs__ = new ResizeObserver(reportHeight);
                 window.__rdrResizeObs__.observe(b);
+                Array.prototype.forEach.call(b.children, function(child) {
+                    window.__rdrResizeObs__.observe(child);
+                });
+            }
+            if (!window.__rdrMutationObs__ && window.MutationObserver) {
+                window.__rdrMutationObs__ = new MutationObserver(function() {
+                    if (window.__rdrResizeObs__) {
+                        Array.prototype.forEach.call(b.children, function(child) {
+                            window.__rdrResizeObs__.observe(child);
+                        });
+                    }
+                    reportHeight();
+                });
+                window.__rdrMutationObs__.observe(b, {
+                    childList: true,
+                    subtree: true,
+                    characterData: true
+                });
             }
             if (!window.__rdrFontsObserved__ && document.fonts) {
                 window.__rdrFontsObserved__ = true;

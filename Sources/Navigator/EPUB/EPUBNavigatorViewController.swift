@@ -1170,6 +1170,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         }
 
         await spreadView.evaluateScript("(function() {\n\(script)\n})();")
+        infiniteScrollView?.spreadViewDidLoad(spreadView)
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {
