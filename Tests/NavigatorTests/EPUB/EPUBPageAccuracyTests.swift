@@ -54,6 +54,32 @@ enum EPUBPageAccuracyTests {
         #expect(locator?.locations.position == 4)
     }
 
+    @Test("terminal progression does not depend on generated positions")
+    static func finalViewportWithoutPositionsReportsCompletion() async {
+        let readingOrder = [
+            Link(href: "chapter-1.xhtml", mediaType: .html),
+            Link(href: "chapter-2.xhtml", mediaType: .html),
+        ]
+        let fallback = Locator(
+            href: AnyURL(string: "chapter-2.xhtml")!,
+            mediaType: .html,
+            locations: .init(progression: 0)
+        )
+
+        let (locator, viewport) = await EPUBViewportAndLocationCalculator.compute(
+            readingOrderIndices: 1 ... 1,
+            progression: { _ in 0.75 ... 1.0 },
+            readingOrder: readingOrder,
+            positionsByReadingOrder: [],
+            tableOfContentsTitleByHref: [:],
+            fallbackLocator: { _ in fallback }
+        )
+
+        #expect(locator?.locations.progression == 0.75)
+        #expect(locator?.locations.totalProgression == 1.0)
+        #expect(viewport.progression == 1.0 ... 1.0)
+    }
+
     private static func makePositions(
         resourceCount: Int,
         positionsPerResource: Int

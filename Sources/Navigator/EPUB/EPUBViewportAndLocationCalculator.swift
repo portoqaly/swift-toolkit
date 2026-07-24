@@ -129,7 +129,16 @@ enum EPUBViewportAndLocationCalculator {
 
         } else {
             locator = await fallbackLocator(link)?.copy(
-                locations: { $0.progression = firstProgressionInFirstResource }
+                locations: {
+                    $0.progression = firstProgressionInFirstResource
+                    // Generated positions can still be hydrating (or be
+                    // unavailable for a WebPub). The physical trailing edge
+                    // of the final resource is nevertheless authoritative:
+                    // terminal state must not depend on the positions service.
+                    if reachesPublicationEnd {
+                        $0.totalProgression = 1.0
+                    }
+                }
             )
 
             let fallbackProgression = locator?.locations.totalProgression
