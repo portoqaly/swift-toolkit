@@ -37,6 +37,16 @@ final class EPUBInfiniteScrollView: UIScrollView {
     /// Actual content heights once each chapter's WebView has rendered.
     private var resolvedHeights: [Int: CGFloat] = [:]
 
+    /// Resources whose DOM finished loading, even if their first intrinsic
+    /// height probe raced WebKit and has not returned a usable value yet.
+    private var readyResourceIndices: Set<Int> = []
+
+    /// Intrinsic-height probes can transiently fail while WebKit is applying
+    /// Readium CSS, fonts, or decorations. Retry with bounded backoff instead
+    /// of leaving the resource permanently unresolved at a scroll boundary.
+    private var measurementAttempts: [Int: Int] = [:]
+    private let maximumMeasurementAttempts = 8
+
     /// Height and prefix-offset indexes for every reading-order resource.
     ///
     /// Keeping geometry for unloaded resources lets a fast fling resolve its
@@ -160,7 +170,16 @@ final class EPUBInfiniteScrollView: UIScrollView {
         guard
             let index = loadedViews.first(where: { $0.value === spreadView })?.key
         else { return }
+        markResourceReady(at: index)
         measureContentHeight(of: spreadView, at: index)
+    }
+
+    /// Marks a resource as safe for direct-manipulation scrolling once its DOM
+    /// is ready. Internal so the boundary-unblocking contract can be tested
+    /// without constructing a WebView.
+    func markResourceReady(at index: Int) {
+        guard 0 ..< chapterCount ~= index else { return }
+        readyResourceIndices.insert(index)
     }
 
     /// Vertical scroll progression within the current chapter (0–1).
@@ -223,11 +242,15 @@ final class EPUBInfiniteScrollView: UIScrollView {
             loadedViews[i]?.removeFromSuperview()
             loadedViews.removeValue(forKey: i)
             heightObservations.removeValue(forKey: i)
+            readyResourceIndices.remove(i)
+            measurementAttempts.removeValue(forKey: i)
         }
 
         // Load new chapters in the window
         for i in lo ... hi where loadedViews[i] == nil {
             guard let view = infiniteDelegate?.infiniteScrollView(self, spreadViewAtIndex: i) else { continue }
+            readyResourceIndices.remove(i)
+            measurementAttempts[i] = 0
             prepareForInfiniteScroll(view)
             loadedViews[i] = view
             addSubview(view)
@@ -384,10 +407,44 @@ final class EPUBInfiniteScrollView: UIScrollView {
                 guard
                     let self,
                     let view,
-                    let height = (result as? NSNumber).map({ CGFloat(truncating: $0) })
+                    self.loadedViews[index] === view
                 else { return }
-                self.applyMeasuredHeight(height, of: view, at: index)
+
+                if
+                    let height = (result as? NSNumber).map({ CGFloat(truncating: $0) }),
+                    height > 20
+                {
+                    self.measurementAttempts.removeValue(forKey: index)
+                    self.applyMeasuredHeight(height, of: view, at: index)
+                } else {
+                    self.scheduleMeasurementRetry(of: view, at: index)
+                }
             }
+        }
+    }
+
+    private func scheduleMeasurementRetry(of view: EPUBSpreadView, at index: Int) {
+        guard
+            loadedViews[index] === view,
+            resolvedHeights[index] == nil
+        else { return }
+
+        let attempt = (measurementAttempts[index] ?? 0) + 1
+        guard attempt <= maximumMeasurementAttempts else { return }
+        measurementAttempts[index] = attempt
+
+        // 0.1, 0.2, 0.4, 0.8, then 1.6 seconds. Eight attempts cover more
+        // than seven seconds of slow CSS/font/decorations work without polling
+        // forever when a malformed resource never produces a body.
+        let delay = min(1.6, 0.1 * pow(2, Double(attempt - 1)))
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak view] in
+            guard
+                let self,
+                let view,
+                self.loadedViews[index] === view,
+                self.resolvedHeights[index] == nil
+            else { return }
+            self.measureContentHeight(of: view, at: index)
         }
     }
 
@@ -434,6 +491,8 @@ final class EPUBInfiniteScrollView: UIScrollView {
         loadedViews.values.forEach { $0.removeFromSuperview() }
         loadedViews.removeAll()
         resolvedHeights.removeAll()
+        readyResourceIndices.removeAll()
+        measurementAttempts.removeAll()
         chapterHeights.removeAll()
         chapterOffsets = [0]
         heightObservations.removeAll()
@@ -642,18 +701,18 @@ final class EPUBInfiniteScrollView: UIScrollView {
         let blocker: Int?
 
         if movingDown {
-            if resolvedHeights[currentIndex] == nil {
+            if resourceRequiresLoad(at: currentIndex) {
                 blocker = currentIndex
             } else if targetIndex > currentIndex {
                 blocker = ((currentIndex + 1) ... targetIndex)
-                    .first { resolvedHeights[$0] == nil }
+                    .first { resourceRequiresLoad(at: $0) }
             } else {
                 blocker = nil
             }
         } else if targetIndex < currentIndex {
             blocker = (targetIndex ..< currentIndex)
                 .reversed()
-                .first { resolvedHeights[$0] == nil }
+                .first { resourceRequiresLoad(at: $0) }
         } else {
             blocker = nil
         }
@@ -671,6 +730,12 @@ final class EPUBInfiniteScrollView: UIScrollView {
         isClampingUserScroll = false
         lastContentOffsetY = clampedY
         return true
+    }
+
+    /// A loaded DOM is safe to enter while its intrinsic-height probe retries.
+    /// The guard only blocks flings across resources which have not loaded yet.
+    func resourceRequiresLoad(at index: Int) -> Bool {
+        resolvedHeights[index] == nil && !readyResourceIndices.contains(index)
     }
 
     private func updateAccessibilityVisibility() {

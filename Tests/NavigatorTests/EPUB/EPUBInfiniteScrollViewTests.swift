@@ -66,6 +66,23 @@ struct EPUBInfiniteScrollViewTests {
         #expect(view.contentOffset.y == 0)
     }
 
+    @Test("a loaded resource stops blocking while intrinsic height retries")
+    func loadedResourceUnblocksBoundary() {
+        let view = makeView(chapterCount: 2)
+        view.setHeight(1200, at: 0)
+        view.markResourceReady(at: 0)
+
+        #expect(view.resourceRequiresLoad(at: 1))
+        view.markResourceReady(at: 1)
+        #expect(!view.resourceRequiresLoad(at: 1))
+
+        view.contentOffset.y = 1200
+        view.scrollViewDidScroll(view)
+
+        #expect(view.currentIndex == 1)
+        #expect(view.contentOffset.y == 1200)
+    }
+
     @Test("the loading window has a hard WebView-count bound")
     func loadingWindowIsBounded() {
         let view = makeView()
