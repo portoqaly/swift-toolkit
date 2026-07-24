@@ -464,9 +464,20 @@ final class EPUBInfiniteScrollView: UIScrollView {
         guard
             height > 20,
             loadedViews[index] === view,
-            chapterHeights.indices.contains(index),
-            resolvedHeights[index] != height
+            chapterHeights.indices.contains(index)
         else { return }
+
+        measurementAttempts.removeValue(forKey: index)
+
+        // Revisiting an evicted resource usually reproduces its cached height.
+        // The new WebView still needs to acknowledge that its DOM is ready and
+        // resume an exact locator navigation. Treating equal geometry as a
+        // complete no-op leaves the pending navigation asleep until timeout.
+        if resolvedHeights[index] == height {
+            markResourceReady(at: index)
+            resumePendingNavigationIfReady(for: index)
+            return
+        }
 
         let anchorIndex = self.index(at: contentOffset.y + 1)
         resolvedHeights[index] = height
