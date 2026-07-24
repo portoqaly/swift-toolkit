@@ -771,17 +771,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// page boundaries, unlike generated Readium positions.
     private func loadSourcePages() async -> [SourcePage] {
         var result: [SourcePage] = []
-        for (offset, link) in publication.pageList.enumerated() {
+        for link in publication.pageList {
             guard
+                let trimmedTitle = link.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+                !trimmedTitle.isEmpty,
                 let locator = await publication.locate(link),
                 let readingOrderIndex = readingOrder.firstIndexWithHREF(locator.href)
             else { continue }
-            let trimmedTitle = link.title?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let label = trimmedTitle.flatMap { $0.isEmpty ? nil : $0 }
-                ?? String(offset + 1)
             result.append(
                 SourcePage(
-                    label: label,
+                    label: trimmedTitle,
                     locator: locator,
                     readingOrderIndex: readingOrderIndex
                 )
