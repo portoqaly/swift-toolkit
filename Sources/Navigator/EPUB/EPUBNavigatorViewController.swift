@@ -737,9 +737,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         if let isv = infiniteScrollView {
             let range = isv.visibleReadingOrderRange
             guard range.upperBound < readingOrder.count else { return (nil, nil) }
+            // Snapshot the first visible resource before any async locator
+            // work. A scroll or geometry correction can move `currentIndex`
+            // while `compute` awaits the publication fallback; mixing that
+            // older base locator with the newer WebView produced impossible
+            // combinations such as chapter-1.xhtml + Page 191 from chapter 2.
+            let resourceIndex = range.lowerBound
+            let visibleOffset = isv.visibleOffset(in: resourceIndex)
+            let viewportHeight = isv.bounds.height
+            let visibleProgressions = Dictionary(
+                uniqueKeysWithValues: range.map { ($0, isv.progression(in: $0)) }
+            )
             let (locator, viewport) = await EPUBViewportAndLocationCalculator.compute(
                 readingOrderIndices: range,
-                progression: { isv.progression(in: $0) },
+                progression: { visibleProgressions[$0] ?? (0 ... 0) },
                 readingOrder: readingOrder,
                 positionsByReadingOrder: positionsByReadingOrder,
                 tableOfContentsTitleByHref: tableOfContentsTitleByHref,
@@ -747,7 +758,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             )
             guard let locator else { return (nil, viewport) }
             return (
-                await enrichInfiniteScrollLocator(locator, in: isv),
+                await enrichInfiniteScrollLocator(
+                    locator,
+                    resourceIndex: resourceIndex,
+                    visibleOffset: visibleOffset,
+                    viewportHeight: viewportHeight,
+                    in: isv
+                ),
                 viewport
             )
         }
@@ -829,15 +846,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// source-page label to a continuous-scroll locator.
     private func enrichInfiniteScrollLocator(
         _ locator: Locator,
+        resourceIndex: Int,
+        visibleOffset: CGFloat,
+        viewportHeight: CGFloat,
         in scrollView: EPUBInfiniteScrollView
     ) async -> Locator {
-        let resourceIndex = scrollView.currentIndex
-        guard let view = scrollView.currentView else { return locator }
+        guard let view = scrollView.loadedViews[resourceIndex] else { return locator }
 
         var enriched = enrichWithSourcePage(locator)
         if let precise = await view.findFirstVisibleElementLocator(
-            verticalOffset: scrollView.visibleOffset(in: resourceIndex),
-            viewportHeight: scrollView.bounds.height
+            verticalOffset: visibleOffset,
+            viewportHeight: viewportHeight
         ) {
             enriched = enriched.copy(
                 locations: {
@@ -857,14 +876,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         let offsets = await view.verticalOffsets(
             for: localPages.map(\.element.locator)
         )
-        let visibleOffset = scrollView.visibleOffset(in: resourceIndex) + 1
+        let pageBoundaryOffset = visibleOffset + 1
 
         var resolvedIndex: Int?
         var greatestOffset = -CGFloat.greatestFiniteMagnitude
         for (candidate, offset) in zip(localPages, offsets) {
             guard
                 let offset,
-                offset <= visibleOffset,
+                offset <= pageBoundaryOffset,
                 offset >= greatestOffset
             else { continue }
             greatestOffset = offset
@@ -897,6 +916,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Used to avoid sending twice the same location.
     private var notifiedCurrentLocation: Locator?
 
+    /// Monotonic token for async viewport calculations.
+    ///
+    /// `execute` coalesces while waiting for `.idle`, but intentionally allows
+    /// a new task while an earlier async block is still resolving DOM anchors.
+    /// Only the newest task may publish a locator.
+    private var locationComputationGeneration: UInt = 0
+
     private lazy var updateCurrentLocation = execute(
         // If we're not in an `idle` state, we postpone the notification.
         when: { [weak self] in self?.state == .idle },
@@ -906,7 +932,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return
         }
 
-        (currentLocation, viewport) = await computeCurrentLocationAndViewport()
+        locationComputationGeneration &+= 1
+        let generation = locationComputationGeneration
+        let result = await computeCurrentLocationAndViewport()
+        guard generation == locationComputationGeneration else { return }
+        (currentLocation, viewport) = result
 
         if
             let delegate = delegate,
