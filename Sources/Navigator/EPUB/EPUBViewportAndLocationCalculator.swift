@@ -39,6 +39,13 @@ enum EPUBViewportAndLocationCalculator {
         let lastIndex = readingOrderIndices.upperBound
         let firstProgressionInFirstResource = min(max(progression(firstIndex).lowerBound, 0.0), 1.0)
         let lastProgressionInLastResource = min(max(progression(lastIndex).upperBound, 0.0), 1.0)
+        // A locator normally anchors the first visible content. At the physical
+        // bottom of the final resource, however, that top edge cannot itself
+        // reach 1.0 because one viewport remains visible. Treat the publication
+        // as complete when the viewport's trailing edge reaches its end.
+        let reachesPublicationEnd =
+            lastIndex == readingOrder.count - 1
+            && lastProgressionInLastResource >= 1.0
 
         let visibleResources: [NavigatorViewport.Resource] = readingOrderIndices
             .map { index in
@@ -97,7 +104,12 @@ enum EPUBViewportAndLocationCalculator {
                 title: tableOfContentsTitleByHref[link.url()],
                 locations: {
                     $0.progression = firstProgressionInFirstResource
-                    $0.totalProgression = totalProgressionRange.lowerBound
+                    $0.totalProgression = reachesPublicationEnd
+                        ? 1.0
+                        : totalProgressionRange.lowerBound
+                    if reachesPublicationEnd {
+                        $0.position = positionsOfLastResource.last?.locations.position
+                    }
                 }
             )
 

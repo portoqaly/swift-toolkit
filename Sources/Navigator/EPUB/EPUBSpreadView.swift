@@ -540,6 +540,35 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         }
     }
 
+    /// Resolves several HTML locators in one JavaScript round trip.
+    ///
+    /// EPUB page lists commonly contain many print-page anchors in the same
+    /// resource. Resolving them one-by-one on every location update would add a
+    /// bridge hop per page; batching keeps source-page reporting observational.
+    func verticalOffsets(for locators: [Locator]) async -> [CGFloat?] {
+        guard !locators.isEmpty else { return [] }
+        let encoded = locators.compactMap { try? $0.jsonString() }
+        guard encoded.count == locators.count else {
+            return Array(repeating: nil, count: locators.count)
+        }
+
+        let script = "[\(encoded.joined(separator: ","))].map(function(locator) { return readium.verticalOffsetForLocator(locator); })"
+        let result = await evaluateScript(script)
+
+        switch result {
+        case let .success(values):
+            guard let values = values as? [Any] else {
+                return Array(repeating: nil, count: locators.count)
+            }
+            return values.map { value in
+                (value as? NSNumber).map { CGFloat(truncating: $0) }
+            }
+        case let .failure(error):
+            log(.error, error)
+            return Array(repeating: nil, count: locators.count)
+        }
+    }
+
     private func findFirstVisibleElementLocator(evaluating script: String) async -> Locator? {
         let result = await evaluateScript(script)
         do {

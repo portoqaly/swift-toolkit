@@ -37,8 +37,9 @@ final class EPUBInfiniteScrollView: UIScrollView {
     /// Actual content heights once each chapter's WebView has rendered.
     private var resolvedHeights: [Int: CGFloat] = [:]
 
-    /// Resources whose DOM finished loading, even if their first intrinsic
-    /// height probe raced WebKit and has not returned a usable value yet.
+    /// Resources whose geometry is safe to enter. Normally this follows a
+    /// valid intrinsic-height measurement; malformed resources fail open only
+    /// after the bounded measurement window.
     private var readyResourceIndices: Set<Int> = []
 
     /// Intrinsic-height probes can transiently fail while WebKit is applying
@@ -170,7 +171,6 @@ final class EPUBInfiniteScrollView: UIScrollView {
         guard
             let index = loadedViews.first(where: { $0.value === spreadView })?.key
         else { return }
-        markResourceReady(at: index)
         measureContentHeight(of: spreadView, at: index)
     }
 
@@ -430,7 +430,16 @@ final class EPUBInfiniteScrollView: UIScrollView {
         else { return }
 
         let attempt = (measurementAttempts[index] ?? 0) + 1
-        guard attempt <= maximumMeasurementAttempts else { return }
+        guard attempt <= maximumMeasurementAttempts else {
+            // Fail open after the bounded probe window. A malformed resource
+            // must not deadlock publication-wide scrolling forever, but a
+            // normal resource cannot be entered while it still has placeholder
+            // geometry (which would make its progression jump backwards when
+            // the real height arrives).
+            markResourceReady(at: index)
+            resumePendingNavigationIfReady(for: index)
+            return
+        }
         measurementAttempts[index] = attempt
 
         // 0.1, 0.2, 0.4, 0.8, then 1.6 seconds. Eight attempts cover more
@@ -476,6 +485,7 @@ final class EPUBInfiniteScrollView: UIScrollView {
             contentOffset = offset
         }
         isUpdatingGeometry = false
+        markResourceReady(at: index)
         refreshCurrentIndex()
         resumePendingNavigationIfReady(for: index)
 
@@ -732,8 +742,9 @@ final class EPUBInfiniteScrollView: UIScrollView {
         return true
     }
 
-    /// A loaded DOM is safe to enter while its intrinsic-height probe retries.
-    /// The guard only blocks flings across resources which have not loaded yet.
+    /// A resource remains blocked until its DOM and intrinsic geometry agree.
+    /// Entering a ready-but-unmeasured placeholder is what caused visible
+    /// location regressions at spine boundaries.
     func resourceRequiresLoad(at index: Int) -> Bool {
         resolvedHeights[index] == nil && !readyResourceIndices.contains(index)
     }

@@ -258,6 +258,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     public private(set) var currentLocation: Locator?
     private let loadPositionsByReadingOrder: () async -> ReadResult<[[Locator]]>
     private var positionsByReadingOrder: [[Locator]] = []
+    private struct SourcePage {
+        let label: String
+        let locator: Locator
+        let readingOrderIndex: Int
+    }
+    private var sourcePages: [SourcePage] = []
 
     private let viewModel: EPUBNavigatorViewModel
     public var publication: Publication {
@@ -420,6 +426,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         } catch {
             log(.error, DebugError("Failed to load positions.", cause: error))
         }
+        sourcePages = await loadSourcePages()
 
         if viewModel.infiniteScroll {
             let isv = EPUBInfiniteScrollView(frame: view.bounds)
@@ -738,7 +745,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 tableOfContentsTitleByHref: tableOfContentsTitleByHref,
                 fallbackLocator: { [publication] in await publication.locate($0) }
             )
-            return (locator, viewport)
+            guard let locator else { return (nil, viewport) }
+            return (
+                await enrichInfiniteScrollLocator(locator, in: isv),
+                viewport
+            )
         }
 
         guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
@@ -753,7 +764,120 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             tableOfContentsTitleByHref: tableOfContentsTitleByHref,
             fallbackLocator: { [publication] in await publication.locate($0) }
         )
-        return (locator, viewport)
+        return (locator.map { enrichWithSourcePage($0) }, viewport)
+    }
+
+    /// Resolves the EPUB page list once. These are publisher-authored print
+    /// page boundaries, unlike generated Readium positions.
+    private func loadSourcePages() async -> [SourcePage] {
+        var result: [SourcePage] = []
+        for (offset, link) in publication.pageList.enumerated() {
+            guard
+                let locator = await publication.locate(link),
+                let readingOrderIndex = readingOrder.firstIndexWithHREF(locator.href)
+            else { continue }
+            let trimmedTitle = link.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let label = trimmedTitle.flatMap { $0.isEmpty ? nil : $0 }
+                ?? String(offset + 1)
+            result.append(
+                SourcePage(
+                    label: label,
+                    locator: locator,
+                    readingOrderIndex: readingOrderIndex
+                )
+            )
+        }
+        return result
+    }
+
+    /// Resolves a publisher page boundary from the current resource and
+    /// progression. This covers paginated mode and is also the fallback while
+    /// continuous mode resolves exact vertical DOM offsets.
+    private func enrichWithSourcePage(_ locator: Locator) -> Locator {
+        guard
+            !sourcePages.isEmpty,
+            let resourceIndex = readingOrder.firstIndexWithHREF(locator.href)
+        else { return locator }
+
+        let progression = locator.locations.progression ?? 0
+        guard let resolvedIndex = sourcePages.lastIndex(where: { page in
+            if page.readingOrderIndex < resourceIndex {
+                return true
+            }
+            guard page.readingOrderIndex == resourceIndex else {
+                return false
+            }
+            guard let pageProgression = page.locator.locations.progression else {
+                return false
+            }
+            return pageProgression <= progression + 0.000_001
+        }) else {
+            return locator
+        }
+        return addingSourcePage(resolvedIndex, to: locator)
+    }
+
+    private func addingSourcePage(_ index: Int, to locator: Locator) -> Locator {
+        let sourcePage = sourcePages[index]
+        return locator.copy(locations: {
+            $0.otherLocations["sourcePageLabel"] = .string(sourcePage.label)
+            $0.otherLocations["sourcePageIndex"] = .integer(index + 1)
+            $0.otherLocations["sourcePageCount"] = .integer(sourcePages.count)
+        })
+    }
+
+    /// Adds a stable DOM anchor and, when available, the publisher's exact
+    /// source-page label to a continuous-scroll locator.
+    private func enrichInfiniteScrollLocator(
+        _ locator: Locator,
+        in scrollView: EPUBInfiniteScrollView
+    ) async -> Locator {
+        let resourceIndex = scrollView.currentIndex
+        guard let view = scrollView.currentView else { return locator }
+
+        var enriched = enrichWithSourcePage(locator)
+        if let precise = await view.findFirstVisibleElementLocator(
+            verticalOffset: scrollView.visibleOffset(in: resourceIndex),
+            viewportHeight: scrollView.bounds.height
+        ) {
+            enriched = enriched.copy(
+                locations: {
+                    $0.fragments = precise.locations.fragments
+                    for (key, value) in precise.locations.otherLocations {
+                        $0.otherLocations[key] = value
+                    }
+                },
+                text: { $0 = precise.text }
+            )
+        }
+
+        guard !sourcePages.isEmpty else { return enriched }
+        let localPages = sourcePages.enumerated().filter {
+            $0.element.readingOrderIndex == resourceIndex
+        }
+        let offsets = await view.verticalOffsets(
+            for: localPages.map(\.element.locator)
+        )
+        let visibleOffset = scrollView.visibleOffset(in: resourceIndex) + 1
+
+        var resolvedIndex: Int?
+        var greatestOffset = -CGFloat.greatestFiniteMagnitude
+        for (candidate, offset) in zip(localPages, offsets) {
+            guard
+                let offset,
+                offset <= visibleOffset,
+                offset >= greatestOffset
+            else { continue }
+            greatestOffset = offset
+            resolvedIndex = candidate.offset
+        }
+        if resolvedIndex == nil {
+            resolvedIndex = sourcePages.lastIndex {
+                $0.readingOrderIndex < resourceIndex
+            }
+        }
+        guard let resolvedIndex else { return enriched }
+        return addingSourcePage(resolvedIndex, to: enriched)
     }
 
     public func firstVisibleElementLocator() async -> Locator? {
