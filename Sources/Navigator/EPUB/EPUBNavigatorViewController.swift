@@ -821,7 +821,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return locator.copy(locations: {
             $0.otherLocations["sourcePageLabel"] = .string(sourcePage.label)
             $0.otherLocations["sourcePageIndex"] = .integer(index + 1)
-            $0.otherLocations["sourcePageCount"] = .integer(sourcePages.count)
+            $0.otherLocations["sourcePageCount"] = .integer(self.sourcePages.count)
         })
     }
 
