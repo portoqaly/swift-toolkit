@@ -37,9 +37,11 @@ final class EPUBInfiniteScrollView: UIScrollView {
     /// Actual content heights once each chapter's WebView has rendered.
     private var resolvedHeights: [Int: CGFloat] = [:]
 
-    /// Resources whose geometry is safe to enter. Normally this follows a
-    /// valid intrinsic-height measurement; malformed resources fail open only
-    /// after the bounded measurement window.
+    /// Resources allowed to resolve explicit locator navigation. Normally this
+    /// follows a valid intrinsic-height measurement; malformed resources fail
+    /// open only after the bounded measurement window. Direct manipulation is
+    /// never blocked on this set — the outer UIScrollView must preserve the
+    /// user's drag and deceleration across every spine boundary.
     private var readyResourceIndices: Set<Int> = []
 
     /// Intrinsic-height probes can transiently fail while WebKit is applying
@@ -83,7 +85,6 @@ final class EPUBInfiniteScrollView: UIScrollView {
     /// Prevents user-scroll loading guards from intercepting explicit locator
     /// navigation and geometry compensation.
     private var isProgrammaticNavigation = false
-    private var isClampingUserScroll = false
     private var lastContentOffsetY: CGFloat = 0
 
     private struct PendingNavigation {
@@ -174,9 +175,8 @@ final class EPUBInfiniteScrollView: UIScrollView {
         measureContentHeight(of: spreadView, at: index)
     }
 
-    /// Marks a resource as safe for direct-manipulation scrolling once its DOM
-    /// is ready. Internal so the boundary-unblocking contract can be tested
-    /// without constructing a WebView.
+    /// Marks a resource as safe for explicit locator resolution once its DOM is
+    /// ready or the bounded measurement window has failed open.
     func markResourceReady(at index: Int) {
         guard 0 ..< chapterCount ~= index else { return }
         readyResourceIndices.insert(index)
@@ -567,7 +567,7 @@ final class EPUBInfiniteScrollView: UIScrollView {
         case .start:
             return true
         case .end, .locator:
-            return resolvedHeights[index] != nil
+            return (resolvedHeights[index] != nil || readyResourceIndices.contains(index))
                 && loadedViews[index]?.isSpreadLoaded == true
         }
     }
@@ -706,60 +706,6 @@ final class EPUBInfiniteScrollView: UIScrollView {
         updateWindow()
     }
 
-    /// Stops a gesture at the first unresolved resource instead of letting a
-    /// fling travel through placeholder geometry for the whole publication.
-    private func clampUserScrollIfNeeded() -> Bool {
-        guard
-            !isUpdatingGeometry,
-            !isProgrammaticNavigation,
-            !isClampingUserScroll,
-            chapterCount > 0
-        else { return false }
-
-        let y = contentOffset.y
-        let targetIndex = index(at: y + 1)
-        let movingDown = y > lastContentOffsetY
-        let blocker: Int?
-
-        if movingDown {
-            if resourceRequiresLoad(at: currentIndex) {
-                blocker = currentIndex
-            } else if targetIndex > currentIndex {
-                blocker = ((currentIndex + 1) ... targetIndex)
-                    .first { resourceRequiresLoad(at: $0) }
-            } else {
-                blocker = nil
-            }
-        } else if targetIndex < currentIndex {
-            blocker = (targetIndex ..< currentIndex)
-                .reversed()
-                .first { resourceRequiresLoad(at: $0) }
-        } else {
-            blocker = nil
-        }
-
-        guard let blocker else { return false }
-
-        let clampedY: CGFloat = movingDown
-            ? yOffset(for: blocker)
-            : max(0, yOffset(for: blocker + 1) - bounds.height)
-
-        isClampingUserScroll = true
-        contentOffset.y = clampedY
-        currentIndex = blocker
-        updateWindow()
-        isClampingUserScroll = false
-        lastContentOffsetY = clampedY
-        return true
-    }
-
-    /// A resource remains blocked until its DOM and intrinsic geometry agree.
-    /// Entering a ready-but-unmeasured placeholder is what caused visible
-    /// location regressions at spine boundaries.
-    func resourceRequiresLoad(at index: Int) -> Bool {
-        resolvedHeights[index] == nil && !readyResourceIndices.contains(index)
-    }
-
     private func updateAccessibilityVisibility() {
         let accessibilityRect = CGRect(
             x: 0,
@@ -796,11 +742,7 @@ final class EPUBInfiniteScrollView: UIScrollView {
 
 extension EPUBInfiniteScrollView: UIScrollViewDelegate {
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        guard !isUpdatingGeometry, !isClampingUserScroll else { return }
-        if clampUserScrollIfNeeded() {
-            infiniteDelegate?.infiniteScrollViewDidScroll(self)
-            return
-        }
+        guard !isUpdatingGeometry else { return }
         refreshCurrentIndex()
         updateAccessibilityVisibility()
         lastContentOffsetY = contentOffset.y

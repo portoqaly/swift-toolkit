@@ -56,25 +56,20 @@ struct EPUBInfiniteScrollViewTests {
         #expect(view.index(at: .greatestFiniteMagnitude) == 3)
     }
 
-    @Test("a fast fling cannot skip across unresolved resources")
-    func fastFlingStopsAtLoadingBoundary() {
+    @Test("a fast fling preserves direct manipulation across unresolved resources")
+    func fastFlingPreservesMomentumDestination() {
         let view = makeView()
         view.contentOffset.y = 80 * 800 + 10
         view.scrollViewDidScroll(view)
 
-        #expect(view.currentIndex == 0)
-        #expect(view.contentOffset.y == 0)
+        #expect(view.currentIndex == 80)
+        #expect(view.contentOffset.y == 80 * 800 + 10)
     }
 
-    @Test("a loaded resource stops blocking while intrinsic height retries")
-    func loadedResourceUnblocksBoundary() {
+    @Test("an unresolved adjacent resource never clamps a user's drag")
+    func unresolvedBoundaryDoesNotClamp() {
         let view = makeView(chapterCount: 2)
         view.setHeight(1200, at: 0)
-        view.markResourceReady(at: 0)
-
-        #expect(view.resourceRequiresLoad(at: 1))
-        view.markResourceReady(at: 1)
-        #expect(!view.resourceRequiresLoad(at: 1))
 
         view.contentOffset.y = 1200
         view.scrollViewDidScroll(view)
