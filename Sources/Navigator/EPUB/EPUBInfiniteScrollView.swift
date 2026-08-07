@@ -546,6 +546,11 @@ final class EPUBInfiniteScrollView: UIScrollView {
             guard let self, self.pendingNavigation?.id == navigation.id else { return }
             self.pendingNavigation = nil
             self.pendingNavigationTimeout = nil
+            // Degrade honestly: recenter the loading window on what is
+            // actually visible instead of leaving it pinned to a target
+            // that never became resolvable (which would show blank
+            // placeholder space with no loaded resource).
+            self.refreshCurrentIndex()
             navigation.completion?(false)
         }
     }
@@ -588,30 +593,36 @@ final class EPUBInfiniteScrollView: UIScrollView {
     }
 
     private func targetOffset(for location: PageLocation, at index: Int) async -> CGFloat {
-        let top = yOffset(for: index)
-        let resourceHeight = height(for: index)
-        let targetY: CGFloat
-
+        // Resolve the chapter-relative offset first: `verticalOffset(for:)`
+        // is a JS round trip, and resources above `index` can resolve their
+        // heights while it is in flight. Reading `yOffset` and clamping after
+        // the await pins the landing to the freshest geometry.
+        let innerOffset: CGFloat
         switch location {
         case .start:
-            targetY = top
+            innerOffset = 0
 
         case .end:
-            targetY = top + resourceHeight - bounds.height
+            innerOffset = height(for: index) - bounds.height
 
         case let .locator(locator):
             if
                 let view = loadedViews[index],
                 let offset = await view.verticalOffset(for: locator)
             {
-                targetY = top + offset
+                innerOffset = offset
             } else {
                 let progression = locator.locations.progression ?? 0
-                targetY = top + resourceHeight * CGFloat(progression)
+                innerOffset = height(for: index) * CGFloat(progression)
             }
         }
 
-        let maxY = max(0, contentSize.height - bounds.height)
+        let targetY = yOffset(for: index) + innerOffset
+        // Clamp against the height index, not `contentSize`: `setHeight`
+        // rebuilds the index synchronously while `contentSize` only catches
+        // up on the next layout pass, and a stale (smaller) contentSize
+        // would truncate a deep navigation.
+        let maxY = max(0, (chapterOffsets.last ?? 0) - bounds.height)
         return min(max(0, targetY), maxY)
     }
 
@@ -699,7 +710,15 @@ final class EPUBInfiniteScrollView: UIScrollView {
     // MARK: - Current Index Tracking
 
     private func refreshCurrentIndex() {
-        guard chapterCount > 0, !isUpdatingGeometry else { return }
+        // A pending navigation IS the current-index intent: `contentOffset`
+        // is stale by definition until its programmatic scroll executes.
+        // Re-deriving the index from the offset here would recenter the
+        // loading window on the old position and evict the navigation
+        // target's spread view mid-load, leaving the navigation unable to
+        // ever resolve (deep restores then die at the timeout, stuck on the
+        // cover). Every path that clears `pendingNavigation` either performs
+        // the scroll or re-runs this refresh, so tracking always resumes.
+        guard chapterCount > 0, !isUpdatingGeometry, pendingNavigation == nil else { return }
         let visibleIndex = index(at: contentOffset.y + 1)
         guard visibleIndex != currentIndex else { return }
         currentIndex = visibleIndex
@@ -750,6 +769,10 @@ extension EPUBInfiniteScrollView: UIScrollViewDelegate {
     }
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        // The user's grab wins over any in-flight locator navigation. This
+        // also reenables offset-driven index tracking, which is suppressed
+        // while a navigation is pending, so the window follows the drag.
+        cancelPendingNavigation()
         isProgrammaticNavigation = false
         lastContentOffsetY = contentOffset.y
     }
