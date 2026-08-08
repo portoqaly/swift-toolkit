@@ -1215,6 +1215,39 @@ extension EPUBNavigatorViewController: EPUBNavigatorViewModelDelegate {
         Task {
             await initialized()
 
+            // In infinite scroll mode the spread views are owned by
+            // `infiniteScrollView` and `paginationView` is nil. Guarding only
+            // on `paginationView` silently dropped every script sent to the
+            // loaded resources — including ReadiumCSS property commits, which
+            // are how CSS-only preference changes (font size, line height,
+            // margins, theme, text alignment, hyphenation, font family) reach
+            // already-loaded WebViews. The submitted preferences were stored,
+            // so resources loaded later rendered with them, but nothing on
+            // screen updated until the navigator was recreated.
+            if let infiniteScrollView = infiniteScrollView {
+                switch scope {
+                case .currentResource:
+                    await infiniteScrollView.currentView?.evaluateScript(script)
+
+                case .loadedResources:
+                    await withTaskGroup(of: Void.self) { tasks in
+                        for (_, view) in infiniteScrollView.loadedViews {
+                            tasks.addTask {
+                                await view.evaluateScript(script)
+                            }
+                        }
+                    }
+
+                case let .resource(href):
+                    guard let index = readingOrder.firstIndexWithHREF(href) else {
+                        return
+                    }
+                    await infiniteScrollView.loadedViews[index]?
+                        .evaluateScript(script, inHREF: href)
+                }
+                return
+            }
+
             guard let paginationView = paginationView else {
                 return
             }
