@@ -128,6 +128,34 @@ extension ReadiumCSS: HTMLInjectable {
         // https://github.com/readium/r2-navigator-kotlin/issues/193
         inj.append(.style("audio[controls] { width: revert; height: revert; }"))
 
+        // Imshi motion. Two rules, both owned by the PAGE because only the
+        // page knows when it actually paints:
+        //
+        // 1. The document reveals itself — a one-shot fade that starts at the
+        //    first rendered frame. No outside signal (location callback,
+        //    cover dissolve) is synchronized with WebKit's first contentful
+        //    paint, so revealing from the app side always either finishes
+        //    over a still-blank WebView or pops. Keyframes run once per
+        //    created document, which also covers scroll-mode rebuilds and
+        //    evicted chapters re-entering the continuous window. Honors the
+        //    system Reduce Motion setting via the media query.
+        //
+        // 2. Appearance-driven colors cross-fade instead of snapping. CSS
+        //    transitions never run before the first rendered frame, so the
+        //    initial theme still applies instantly (no dark-mode flash) —
+        //    they animate only a LATER change, i.e. a theme commit into an
+        //    already-painted page. Scrolling and pagination change no colors,
+        //    so the rules are inert on the reading path.
+        inj.append(.style("""
+        @media (prefers-reduced-motion: no-preference) {
+          body { animation: __imshi_reveal 350ms ease-out; }
+          @keyframes __imshi_reveal { from { opacity: 0; } to { opacity: 1; } }
+        }
+        html, body, body * {
+          transition: color 240ms ease-out, background-color 240ms ease-out;
+        }
+        """))
+
         return inj
     }
 
