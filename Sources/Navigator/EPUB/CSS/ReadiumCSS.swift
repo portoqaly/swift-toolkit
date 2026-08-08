@@ -128,31 +128,35 @@ extension ReadiumCSS: HTMLInjectable {
         // https://github.com/readium/r2-navigator-kotlin/issues/193
         inj.append(.style("audio[controls] { width: revert; height: revert; }"))
 
-        // Imshi motion. Two rules, both owned by the PAGE because only the
-        // page knows when it actually paints:
+        // Imshi motion, owned by the page.
         //
-        // 1. The document reveals itself — a one-shot fade that starts at the
-        //    first rendered frame. No outside signal (location callback,
-        //    cover dissolve) is synchronized with WebKit's first contentful
-        //    paint, so revealing from the app side always either finishes
-        //    over a still-blank WebView or pops. Keyframes run once per
-        //    created document, which also covers scroll-mode rebuilds and
-        //    evicted chapters re-entering the continuous window. Honors the
-        //    system Reduce Motion setting via the media query.
-        //
-        // 2. Appearance-driven colors cross-fade instead of snapping. CSS
+        // 1. Appearance-driven colours cross-fade instead of snapping. CSS
         //    transitions never run before the first rendered frame, so the
         //    initial theme still applies instantly (no dark-mode flash) —
         //    they animate only a LATER change, i.e. a theme commit into an
-        //    already-painted page. Scrolling and pagination change no colors,
-        //    so the rules are inert on the reading path.
+        //    already-painted page. Scrolling and pagination change no
+        //    colours, so the rules are inert on the reading path.
+        //
+        // 2. `__imshi-reflowing` fades the text down so a TYPE change (size,
+        //    typeface, line height, margins) re-wraps while it is invisible,
+        //    then fades back carrying the new type. The view model adds the
+        //    class, waits for this fade-out to finish, applies the CSS, and
+        //    removes it. Fade-out is deliberately faster than fade-in: the
+        //    reader is waiting on the out, and reading the in.
+        //
+        // The document's own ENTRANCE is NOT here — Readium already fades a
+        // spread in from `showSpread()` when its JS reports the content is
+        // loaded, which is the only clock that matches what the eye sees. A
+        // keyframe here starts at layout instead, so it ran out while the
+        // scroll view was still at alpha 0 and the text appeared to pop
+        // (owner, 2026-08-08). The fix is `animatedLoad: true`, not CSS.
         inj.append(.style("""
-        @media (prefers-reduced-motion: no-preference) {
-          body { animation: __imshi_reveal 350ms ease-out; }
-          @keyframes __imshi_reveal { from { opacity: 0; } to { opacity: 1; } }
-        }
         html, body, body * {
           transition: color 240ms ease-out, background-color 240ms ease-out;
+        }
+        @media (prefers-reduced-motion: no-preference) {
+          body { transition: color 240ms ease-out, background-color 240ms ease-out, opacity 220ms ease-out; }
+          html.__imshi-reflowing body { opacity: 0.02; transition: opacity 100ms ease-in; }
         }
         """))
 

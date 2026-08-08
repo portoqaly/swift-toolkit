@@ -1549,7 +1549,14 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
             viewModel: viewModel,
             spread: spread,
             scripts: [],
-            animatedLoad: false
+            // Readium's OWN reveal, re-enabled. `showSpread()` fades the
+            // scroll view in when the spread's JS reports `spreadLoaded` —
+            // i.e. when the content is genuinely painted, which is the only
+            // clock that matches what the reader sees. With this false the
+            // alpha snapped 0 -> 1 and the text POPPED after a themed blank
+            // (owner, 2026-08-08). A CSS keyframe cannot replace it: those
+            // start at layout, so they run out while alpha is still 0.
+            animatedLoad: true
         )
         spreadView.delegate = self
 
@@ -1581,7 +1588,14 @@ extension EPUBNavigatorViewController: EPUBInfiniteScrollViewDelegate {
             viewModel: viewModel,
             spread: spread,
             scripts: [],
-            animatedLoad: false
+            // Readium's OWN reveal, re-enabled. `showSpread()` fades the
+            // scroll view in when the spread's JS reports `spreadLoaded` —
+            // i.e. when the content is genuinely painted, which is the only
+            // clock that matches what the reader sees. With this false the
+            // alpha snapped 0 -> 1 and the text POPPED after a themed blank
+            // (owner, 2026-08-08). A CSS keyframe cannot replace it: those
+            // start at layout, so they run out while alpha is still 0.
+            animatedLoad: true
         )
         spreadView.delegate = self
 

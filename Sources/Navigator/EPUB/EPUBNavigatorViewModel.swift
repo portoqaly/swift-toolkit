@@ -230,9 +230,31 @@ enum EPUBScriptScope {
                 || oldSettings.fit != newSettings.fit
                 || oldSettings.offsetFirstPage != newSettings.offsetFirstPage
 
+        // A commit that changes TYPE rather than colour reflows the text, and
+        // watching a page re-wrap line by line is the ugly half of changing a
+        // setting. Cross-fade those (see `commitCSSChange`); colour-only
+        // commits already transition per-pixel through the injected
+        // stylesheet and must NOT be hidden behind an opacity dip, which
+        // would replace a smooth tint with a blink.
+        let reflows: Bool =
+            oldSettings.fontSize != newSettings.fontSize
+                || oldSettings.fontFamily != newSettings.fontFamily
+                || oldSettings.fontWeight != newSettings.fontWeight
+                || oldSettings.lineHeight != newSettings.lineHeight
+                || oldSettings.pageMargins != newSettings.pageMargins
+                || oldSettings.hyphens != newSettings.hyphens
+                || oldSettings.textAlign != newSettings.textAlign
+                || oldSettings.letterSpacing != newSettings.letterSpacing
+                || oldSettings.wordSpacing != newSettings.wordSpacing
+                || oldSettings.paragraphSpacing != newSettings.paragraphSpacing
+                || oldSettings.paragraphIndent != newSettings.paragraphIndent
+                || oldSettings.typeScale != newSettings.typeScale
+                || oldSettings.textNormalization != newSettings.textNormalization
+                || oldSettings.publisherStyles != newSettings.publisherStyles
+
         // We don't commit the CSS changes if we invalidate the pagination, as
         // the resources will be reloaded anyway.
-        updateCSS(with: settings, commitNow: !needsInvalidation)
+        updateCSS(with: settings, commitNow: !needsInvalidation, reflows: reflows)
 
         if needsInvalidation {
             setNeedsInvalidatePagination()
@@ -350,7 +372,7 @@ enum EPUBScriptScope {
         }
     }
 
-    private func updateCSS(with settings: EPUBSettings, commitNow: Bool) {
+    private func updateCSS(with settings: EPUBSettings, commitNow: Bool, reflows: Bool = false) {
         let previous = css
         css.update(with: settings)
 
@@ -362,11 +384,11 @@ enum EPUBScriptScope {
         server.clearResourceCache { _, mediaType in mediaType.isHTML }
 
         if commitNow {
-            commitCSSChange(from: previous, to: css)
+            commitCSSChange(from: previous, to: css, reflows: reflows)
         }
     }
 
-    private func commitCSSChange(from previous: ReadiumCSS, to new: ReadiumCSS) {
+    private func commitCSSChange(from previous: ReadiumCSS, to new: ReadiumCSS, reflows: Bool = false) {
         var properties: [String: String?] = [:]
         let rsProperties = new.rsProperties.cssProperties()
         if previous.rsProperties.cssProperties() != rsProperties {
@@ -389,9 +411,38 @@ enum EPUBScriptScope {
                 return
             }
 
+            // A reflowing commit is wrapped in a fade so the re-wrap happens
+            // while the text is down: fade out (fast), apply on the next
+            // frame, then release the class once layout has settled so the
+            // page fades back in carrying the new type. The class drives an
+            // opacity transition from our injected stylesheet, so a build
+            // whose page CSS is missing simply applies instantly instead of
+            // getting stuck invisible. Colour-only commits skip this and keep
+            // their per-pixel tint transition.
+            let script: String = reflows
+                ? """
+                (function(){
+                  var d = document.documentElement;
+                  d.classList.add('__imshi-reflowing');
+                  // Let the fade-out FINISH before re-wrapping. Applying on
+                  // the next frame instead meant the text re-flowed at ~75%
+                  // opacity — still plainly visible, so the jump the fade
+                  // exists to hide was only softened (measured 2026-08-08).
+                  setTimeout(function(){
+                    readium.setCSSProperties(\(json));
+                    requestAnimationFrame(function(){
+                      requestAnimationFrame(function(){
+                        d.classList.remove('__imshi-reflowing');
+                      });
+                    });
+                  }, 110);
+                })();
+                """
+                : "readium.setCSSProperties(\(json));"
+
             delegate?.epubNavigatorViewModel(
                 self,
-                runScript: "readium.setCSSProperties(\(json));",
+                runScript: script,
                 in: .loadedResources
             )
         }
