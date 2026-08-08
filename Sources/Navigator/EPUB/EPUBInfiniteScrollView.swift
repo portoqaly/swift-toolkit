@@ -480,6 +480,10 @@ final class EPUBInfiniteScrollView: UIScrollView {
         }
 
         let anchorIndex = self.index(at: contentOffset.y + 1)
+        // Where the reader is sitting INSIDE this resource, captured before
+        // the geometry changes underneath them.
+        let previousHeight = chapterHeights[index]
+        let viewportTopInChapter = contentOffset.y - yOffset(for: index)
         resolvedHeights[index] = height
         guard let delta = setHeight(height, at: index) else { return }
 
@@ -487,12 +491,35 @@ final class EPUBInfiniteScrollView: UIScrollView {
         setNeedsLayout()
         layoutIfNeeded()
 
-        // Preserve the same document pixel when a resource above the viewport
-        // resolves. The current resource needs no correction: its DOM origin
-        // remains fixed while its frame grows or shrinks around the content.
         if index < anchorIndex, delta != 0 {
+            // A resource ABOVE the viewport resolved: shift by the whole
+            // delta so the same document pixel stays under the reader's eye.
             var offset = contentOffset
             offset.y = max(0, offset.y + delta)
+            contentOffset = offset
+        } else if index == anchorIndex, delta != 0,
+                  previousHeight > 0, viewportTopInChapter > 0
+        {
+            // The resource the reader is INSIDE just reflowed — a font size,
+            // line height, margin, or typeface commit. Its DOM origin is
+            // pinned, so the frame grows downward around the content and
+            // every line below that origin slides: the reader's top line
+            // walks off by (how far they are through the resource x delta).
+            // That is the "it jumps when I zoom" report, and correcting it
+            // afterwards is the "it moves later" half.
+            //
+            // Reflowed text rescales roughly uniformly, so holding the same
+            // FRACTION of the resource above the fold holds the top line. It
+            // happens in the SAME layout pass as the resize, so the content
+            // never paints at the wrong offset — there is no second movement
+            // to see.
+            let scale = height / previousHeight
+            let maxOffset = max(0, contentSize.height - bounds.height)
+            var offset = contentOffset
+            offset.y = min(
+                maxOffset,
+                max(0, yOffset(for: index) + viewportTopInChapter * scale)
+            )
             contentOffset = offset
         }
         isUpdatingGeometry = false
